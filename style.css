@@ -1,0 +1,18 @@
+/* Minimal custom styles. Most UI is handled by Tailwind classes. */
+
+/* Improve canvas crispness and add subtle rounding */
+#game {
+  image-rendering: optimizeQuality;
+  border-radius: 1rem; /* matches rounded-2xl container */
+}
+
+/* Smooth focus outlines on keyboard navigation */
+:focus-visible {
+  outline: none;
+}
+
+/* Subtle body gradient fallback if Tailwind classes are not applied */
+body {
+  background-image: linear-gradient(to bottom, #f5f5f5, #e5e5e5);
+}
+
