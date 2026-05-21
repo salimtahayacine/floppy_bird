@@ -1,5 +1,5 @@
-// Flappy Bird — Modern Clone
-// Clean, readable code with time-based updates and crisp canvas rendering
+// Flappy Bird — Modern Clone (Enhanced)
+// Enhancements: Web Audio sound effects, difficulty scaling, screen shake, score flash, level indicator
 
 (function () {
   'use strict';
@@ -16,11 +16,10 @@
 
   const ctx = canvas.getContext('2d');
 
-  // Logical canvas size (do not change without adjusting CSS as well)
-  const LOGICAL_WIDTH = canvas.width; // 432
+  const LOGICAL_WIDTH = canvas.width;  // 432
   const LOGICAL_HEIGHT = canvas.height; // 768
 
-  // HiDPI scaling for crisp rendering
+  // HiDPI scaling for crisp rendering on high-DPI displays
   function configureCanvasForDevicePixelRatio() {
     const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
     canvas.width = Math.floor(LOGICAL_WIDTH * dpr);
@@ -30,15 +29,15 @@
   configureCanvasForDevicePixelRatio();
   window.addEventListener('resize', configureCanvasForDevicePixelRatio);
 
-  // Game constants
-  const GRAVITY_PER_SEC = 1500; // px/s^2
-  const JUMP_VELOCITY = -420; // px/s
-  const TERMINAL_VELOCITY = 900; // px/s
-  const PIPE_SPEED = 160; // px/s to the left
-  const PIPE_WIDTH = 72; // px
-  const PIPE_GAP = 180; // px gap between top and bottom pipe
-  const PIPE_SPAWN_INTERVAL_MS = 1300; // spawn cadence
-  const BIRD_RADIUS = 14; // px
+  // Base game constants — difficulty scaling adjusts these at runtime
+  const GRAVITY_PER_SEC = 1500;
+  const JUMP_VELOCITY = -420;
+  const TERMINAL_VELOCITY = 900;
+  const BASE_PIPE_SPEED = 160;       // px/s
+  const BASE_PIPE_GAP = 180;         // px
+  const BASE_SPAWN_INTERVAL_MS = 1300; // ms
+  const PIPE_WIDTH = 72;
+  const BIRD_RADIUS = 14;
   const BIRD_X = Math.floor(LOGICAL_WIDTH * 0.28);
 
   const STATE = {
@@ -48,10 +47,94 @@
     GAME_OVER: 'gameover',
   };
 
-  /** @typedef {{ x:number, gapY:number, passed:boolean }} Pipe */
+  // --- Web Audio sound engine ---
+  let audioCtx = null;
+
+  function getAudioCtx() {
+    if (!audioCtx) {
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      } catch (_) {}
+    }
+    return audioCtx;
+  }
+
+  function playTone(freq, type, duration, gainVal, freqEnd) {
+    const ac = getAudioCtx();
+    if (!ac) return;
+    try {
+      const osc = ac.createOscillator();
+      const gain = ac.createGain();
+      osc.connect(gain);
+      gain.connect(ac.destination);
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, ac.currentTime);
+      if (freqEnd !== undefined) {
+        osc.frequency.linearRampToValueAtTime(freqEnd, ac.currentTime + duration);
+      }
+      gain.gain.setValueAtTime(gainVal, ac.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + duration);
+      osc.start(ac.currentTime);
+      osc.stop(ac.currentTime + duration);
+    } catch (_) {}
+  }
+
+  function sfxFlap() {
+    playTone(400, 'sine', 0.08, 0.12, 600);
+  }
+
+  function sfxScore() {
+    playTone(880, 'sine', 0.1, 0.18, 1100);
+    setTimeout(() => playTone(1200, 'sine', 0.1, 0.14), 90);
+  }
+
+  function sfxDeath() {
+    playTone(280, 'sawtooth', 0.25, 0.22, 80);
+    setTimeout(() => playTone(110, 'sawtooth', 0.35, 0.18, 60), 160);
+  }
+
+  // --- Difficulty scaling ---
+  // Every 5 points: pipes speed up, gap shrinks, and spawns quicken (all capped)
+  function getDifficulty(currentScore) {
+    const level = Math.floor(currentScore / 5);
+    return {
+      pipeSpeed: Math.min(BASE_PIPE_SPEED + level * 14, 340),
+      pipeGap: Math.max(BASE_PIPE_GAP - level * 7, 115),
+      spawnInterval: Math.max(BASE_SPAWN_INTERVAL_MS - level * 55, 780),
+      level: level + 1,
+    };
+  }
+
+  // --- Screen shake ---
+  let shakeTimeRemaining = 0;
+  const SHAKE_DURATION = 0.38;
+  const SHAKE_INTENSITY = 9;
+
+  function triggerShake() {
+    shakeTimeRemaining = SHAKE_DURATION;
+  }
+
+  function getShakeOffset() {
+    if (shakeTimeRemaining <= 0) return { x: 0, y: 0 };
+    const factor = shakeTimeRemaining / SHAKE_DURATION;
+    return {
+      x: (Math.random() * 2 - 1) * SHAKE_INTENSITY * factor,
+      y: (Math.random() * 2 - 1) * SHAKE_INTENSITY * factor,
+    };
+  }
+
+  // --- Score flash ---
+  function triggerScoreFlash() {
+    scoreEl.classList.remove('score-flash');
+    // Force reflow so re-adding the class restarts the animation
+    void scoreEl.offsetWidth;
+    scoreEl.classList.add('score-flash');
+  }
+
+  // --- Pipes ---
   /**
-   * Pipes are represented by x position and vertical center of the gap (gapY).
-   * Top pipe extends from y=0 to (gapY - PIPE_GAP/2). Bottom starts at (gapY + PIPE_GAP/2) to canvas bottom.
+   * @typedef {{ x: number, gapY: number, gapSize: number, passed: boolean }} Pipe
+   * gapSize is baked in at spawn time so existing pipes aren't retroactively resized.
    */
   const pipes = /** @type {Pipe[]} */ ([]);
 
@@ -64,8 +147,12 @@
     x: BIRD_X,
     y: LOGICAL_HEIGHT * 0.4,
     velocityY: 0,
-    angle: 0, // visual tilt only
+    angle: 0,
   };
+
+  let lastTimestampMs = 0;
+  let lastSpawnAtMs = 0;
+  let timeSinceStartMs = 0;
 
   function resetGame() {
     pipes.length = 0;
@@ -77,6 +164,8 @@
     bird.angle = 0;
     lastSpawnAtMs = 0;
     timeSinceStartMs = 0;
+    shakeTimeRemaining = 0;
+    scoreEl.classList.remove('score-flash');
   }
 
   function updateScore(value) {
@@ -98,15 +187,17 @@
     overlay.style.pointerEvents = 'none';
   }
 
-  // Input handlers
+  // --- Input ---
   function flap() {
     if (gameState === STATE.PAUSED) return;
     if (gameState === STATE.READY) {
       startGame();
+      return;
     }
     if (gameState === STATE.PLAYING) {
       bird.velocityY = JUMP_VELOCITY;
-      bird.angle = -0.35; // slight tilt up
+      bird.angle = -0.35;
+      sfxFlap();
     }
     if (gameState === STATE.GAME_OVER) {
       startGame();
@@ -123,10 +214,17 @@
     }
   }
 
-  // Events
   startBtn.addEventListener('click', flap);
   howBtn.addEventListener('click', () => {
-    alert('How to play:\n\n- Tap/click/Space to flap\n- Fly through gaps to score\n- Avoid pipes and boundaries\n- Press P to pause');
+    alert(
+      'How to play:\n\n' +
+      '• Tap / click / Space to flap\n' +
+      '• Fly through pipe gaps to score\n' +
+      '• Avoid pipes and screen boundaries\n' +
+      '• Press P to pause\n\n' +
+      'Difficulty increases every 5 points —\n' +
+      'pipes get faster, closer together, and spawn quicker!'
+    );
   });
   canvas.addEventListener('pointerdown', flap);
   window.addEventListener('keydown', (e) => {
@@ -139,12 +237,12 @@
     }
   });
 
-  // Game loop state
-  let lastTimestampMs = 0;
-  let lastSpawnAtMs = 0;
-  let timeSinceStartMs = 0;
-
+  // --- Game lifecycle ---
   function startGame() {
+    // Unlock AudioContext on first user gesture (browser policy)
+    const ac = getAudioCtx();
+    if (ac && ac.state === 'suspended') ac.resume();
+
     resetGame();
     hideOverlay();
     gameState = STATE.PLAYING;
@@ -152,74 +250,84 @@
 
   function gameOver() {
     gameState = STATE.GAME_OVER;
+    sfxDeath();
+    triggerShake();
     if (score > best) {
       best = score;
-      try {
-        localStorage.setItem('flappy-highscore', String(best));
-      } catch (_) {}
+      try { localStorage.setItem('flappy-highscore', String(best)); } catch (_) {}
     }
     showOverlay('Game Over', `Score: ${score} • Best: ${best}`);
   }
 
-  // Pipe helpers
+  // --- Pipe helpers ---
   function spawnPipe() {
-    const margin = 80; // keep gap fully on screen
-    const minY = margin + PIPE_GAP / 2;
-    const maxY = LOGICAL_HEIGHT - margin - PIPE_GAP / 2;
+    const { pipeGap } = getDifficulty(score);
+    const margin = 80;
+    const minY = margin + pipeGap / 2;
+    const maxY = LOGICAL_HEIGHT - margin - pipeGap / 2;
     const gapY = Math.floor(minY + Math.random() * (maxY - minY));
-    pipes.push({ x: LOGICAL_WIDTH + PIPE_WIDTH, gapY, passed: false });
+    pipes.push({ x: LOGICAL_WIDTH + PIPE_WIDTH, gapY, gapSize: pipeGap, passed: false });
   }
 
+  // --- Update ---
   function update(dtSec) {
     if (gameState !== STATE.PLAYING) return;
 
+    if (shakeTimeRemaining > 0) shakeTimeRemaining = Math.max(0, shakeTimeRemaining - dtSec);
+
     timeSinceStartMs += dtSec * 1000;
+
+    const diff = getDifficulty(score);
 
     // Bird physics
     bird.velocityY = Math.min(bird.velocityY + GRAVITY_PER_SEC * dtSec, TERMINAL_VELOCITY);
     bird.y += bird.velocityY * dtSec;
-    bird.angle = Math.min(bird.angle + 1.2 * dtSec, 0.5); // ease towards down tilt
+    bird.angle = Math.min(bird.angle + 1.2 * dtSec, 0.5);
 
-    // Boundaries
+    // Boundary: ceiling
     if (bird.y - BIRD_RADIUS <= 0) {
       bird.y = BIRD_RADIUS;
       bird.velocityY = 0;
     }
+    // Boundary: floor
     if (bird.y + BIRD_RADIUS >= LOGICAL_HEIGHT) {
       bird.y = LOGICAL_HEIGHT - BIRD_RADIUS;
       gameOver();
+      return;
     }
 
-    // Pipes spawn
-    if (timeSinceStartMs - lastSpawnAtMs >= PIPE_SPAWN_INTERVAL_MS) {
+    // Pipe spawning
+    if (timeSinceStartMs - lastSpawnAtMs >= diff.spawnInterval) {
       spawnPipe();
       lastSpawnAtMs = timeSinceStartMs;
     }
 
-    // Pipes update and collisions
+    // Pipe movement, scoring, and collision
     for (let i = pipes.length - 1; i >= 0; i--) {
       const p = pipes[i];
-      p.x -= PIPE_SPEED * dtSec;
+      p.x -= diff.pipeSpeed * dtSec;
 
-      // Score when passing the pipe center
       if (!p.passed && p.x + PIPE_WIDTH < bird.x) {
         p.passed = true;
         updateScore(score + 1);
+        sfxScore();
+        triggerScoreFlash();
       }
 
-      // Remove off-screen pipes
       if (p.x + PIPE_WIDTH < -8) {
         pipes.splice(i, 1);
         continue;
       }
 
-      // Collision check (circle vs AABB)
-      const topPipe = { x: p.x, y: 0, w: PIPE_WIDTH, h: p.gapY - PIPE_GAP / 2 };
-      const bottomPipe = { x: p.x, y: p.gapY + PIPE_GAP / 2, w: PIPE_WIDTH, h: LOGICAL_HEIGHT - (p.gapY + PIPE_GAP / 2) };
+      // Collision uses each pipe's own baked-in gapSize
+      const half = p.gapSize / 2;
+      const topRect  = { x: p.x, y: 0,                   w: PIPE_WIDTH, h: p.gapY - half };
+      const botRect  = { x: p.x, y: p.gapY + half,       w: PIPE_WIDTH, h: LOGICAL_HEIGHT - (p.gapY + half) };
 
-      if (circleIntersectsRect(bird.x, bird.y, BIRD_RADIUS, topPipe) || circleIntersectsRect(bird.x, bird.y, BIRD_RADIUS, bottomPipe)) {
+      if (circleIntersectsRect(bird.x, bird.y, BIRD_RADIUS, topRect) ||
+          circleIntersectsRect(bird.x, bird.y, BIRD_RADIUS, botRect)) {
         gameOver();
-        break;
+        return;
       }
     }
   }
@@ -236,18 +344,26 @@
     return Math.max(min, Math.min(max, v));
   }
 
-  // Rendering
+  // --- Rendering ---
   function draw() {
-    // Background
+    const shake = getShakeOffset();
+
+    ctx.save();
+    ctx.translate(shake.x, shake.y);
+
     drawBackground();
 
-    // Pipes
     for (const p of pipes) {
-      drawPipePair(p.x, p.gapY);
+      drawPipePair(p.x, p.gapY, p.gapSize);
     }
 
-    // Bird
     drawBird(bird.x, bird.y, bird.angle);
+
+    if (gameState === STATE.PLAYING && score > 0) {
+      drawLevelIndicator(getDifficulty(score).level);
+    }
+
+    ctx.restore();
   }
 
   function drawBackground() {
@@ -257,41 +373,46 @@
     ctx.fillStyle = g;
     ctx.fillRect(0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
 
-    // Soft vignette
     ctx.fillStyle = 'rgba(0,0,0,0.03)';
     ctx.fillRect(-20, -20, LOGICAL_WIDTH + 40, 20);
   }
 
-  function drawPipePair(x, gapY) {
-    const topH = gapY - PIPE_GAP / 2;
-    const botY = gapY + PIPE_GAP / 2;
+  function drawPipePair(x, gapY, gapSize) {
+    const topH = gapY - gapSize / 2;
+    const botY = gapY + gapSize / 2;
     const botH = LOGICAL_HEIGHT - botY;
 
-    // Pipe style
-    const pipeGradient = ctx.createLinearGradient(0, 0, PIPE_WIDTH, 0);
-    pipeGradient.addColorStop(0, '#86efac');
-    pipeGradient.addColorStop(1, '#22c55e');
-    ctx.fillStyle = pipeGradient;
+    const pipeGrad = ctx.createLinearGradient(x, 0, x + PIPE_WIDTH, 0);
+    pipeGrad.addColorStop(0, '#86efac');
+    pipeGrad.addColorStop(1, '#22c55e');
+    ctx.fillStyle = pipeGrad;
     ctx.strokeStyle = 'rgba(0,0,0,0.08)';
     ctx.lineWidth = 2;
 
-    // Top pipe
-    roundRect(ctx, x, 0, PIPE_WIDTH, topH, 8, true, true);
-
-    // Bottom pipe
+    roundRect(ctx, x, 0,    PIPE_WIDTH, topH, 8, true, true);
     roundRect(ctx, x, botY, PIPE_WIDTH, botH, 8, true, true);
+  }
+
+  function drawLevelIndicator(level) {
+    ctx.fillStyle = 'rgba(0,0,0,0.18)';
+    ctx.font = '600 12px Inter, sans-serif';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'top';
+    ctx.fillText(`LVL ${level}`, LOGICAL_WIDTH - 12, 12);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
   }
 
   function roundRect(ctx, x, y, w, h, r, fill, stroke) {
     const radius = Math.min(r, w / 2, h / 2);
     ctx.beginPath();
     ctx.moveTo(x + radius, y);
-    ctx.arcTo(x + w, y, x + w, y + h, radius);
-    ctx.arcTo(x + w, y + h, x, y + h, radius);
-    ctx.arcTo(x, y + h, x, y, radius);
-    ctx.arcTo(x, y, x + w, y, radius);
+    ctx.arcTo(x + w, y,   x + w, y + h, radius);
+    ctx.arcTo(x + w, y + h, x,   y + h, radius);
+    ctx.arcTo(x,   y + h, x,   y,       radius);
+    ctx.arcTo(x,   y,     x + w, y,     radius);
     ctx.closePath();
-    if (fill) ctx.fill();
+    if (fill)   ctx.fill();
     if (stroke) ctx.stroke();
   }
 
@@ -312,11 +433,12 @@
     ctx.ellipse(-4, 2, 7, 5, -0.5, 0, Math.PI * 2);
     ctx.fill();
 
-    // Eye
+    // Eye white
     ctx.fillStyle = '#ffffff';
     ctx.beginPath();
     ctx.arc(4, -4, 4, 0, Math.PI * 2);
     ctx.fill();
+    // Pupil
     ctx.fillStyle = '#0f172a';
     ctx.beginPath();
     ctx.arc(5, -4, 2, 0, Math.PI * 2);
@@ -334,14 +456,12 @@
     ctx.restore();
   }
 
-  // Main loop
+  // --- Main loop ---
   function frame(timestampMs) {
     if (lastTimestampMs === 0) lastTimestampMs = timestampMs;
-    let dt = (timestampMs - lastTimestampMs) / 1000; // seconds
+    let dt = (timestampMs - lastTimestampMs) / 1000;
     lastTimestampMs = timestampMs;
-
-    // Clamp delta to avoid huge jumps on tab switch
-    dt = Math.max(0, Math.min(0.035, dt));
+    dt = Math.max(0, Math.min(0.035, dt)); // clamp to avoid physics spikes on tab switch
 
     update(dt);
     draw();
@@ -349,8 +469,6 @@
     requestAnimationFrame(frame);
   }
 
-  // Initial state
   showOverlay('Flappy Bird', 'Tap, click, or press Space to flap');
   requestAnimationFrame(frame);
 })();
-

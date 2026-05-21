@@ -16,3 +16,14 @@ body {
   background-image: linear-gradient(to bottom, #f5f5f5, #e5e5e5);
 }
 
+/* Score flash animation on point scored */
+@keyframes score-pop {
+  0%   { transform: translateX(-50%) scale(1); }
+  40%  { transform: translateX(-50%) scale(1.35); color: #2563eb; }
+  100% { transform: translateX(-50%) scale(1); }
+}
+
+#score.score-flash {
+  animation: score-pop 0.28s ease-out forwards;
+}
+
